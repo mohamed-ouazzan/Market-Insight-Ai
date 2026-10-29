@@ -1,134 +1,132 @@
-from __future__ import annotations
-
+"""Indicateurs calculés exclusivement en Python, sur le périmètre affiché."""
 import pandas as pd
 import plotly.express as px
-
 from db_connection import read_valid_offers
+from provenance import is_synthetic, origin_label, ORIGIN, REAL, SIMULATED
+from offer_evidence import unpack_proof
+
+BASE_COLUMNS = ['id_offre', 'operateur', 'nom_offre', 'segment', 'technologie', 'debit_mbps',
+                'prix_mensuel_ttc', 'engagement_mois', 'frais_installation_ttc', 'appels_inclus',
+                'conditions_offre', 'nom_fichier', 'edition', 'url_source', 'page_source', 'extrait_source']
+NUMERIC = ['debit_mbps', 'prix_mensuel_ttc', 'engagement_mois', 'frais_installation_ttc']
+LABELS = {'operateur': 'Opérateur', 'nom_offre': 'Offre', 'debit_mbps': 'Débit (Mbps)',
+          'prix_mensuel_ttc': 'Prix mensuel TTC', 'engagement_mois': 'Engagement',
+          'appels_inclus': 'Services inclus', 'frais_installation_ttc': 'Installation TTC',
+          'conditions_offre': 'Conditions', 'prix_par_100_mbps': 'DH / 100 Mbps',
+          'prix_median_market': 'Médiane du palier (DH)', 'ecart_a_median_market': 'Écart médiane (DH)',
+          'rang_operateur': 'Rang du meilleur prix opérateur'}
+# Les constantes importées restent réexportées pour les appelants existants.
+LABELS[ORIGIN] = 'Origine des données'
 
 
-def _prepare_offers_frame(raw_rows):
-    if not raw_rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(raw_rows)
-    numeric_cols = [
-        'debit_mbps',
-        'prix_mensuel_ttc',
-        'engagement_mois',
-        'frais_installation_ttc',
-    ]
-    for col in numeric_cols:
+def _prepare_offers_frame(raw_rows, *, dataset='real'):
+    if dataset not in {'real', 'simulated', 'all'}:
+        raise ValueError('Périmètre de données inconnu.')
+    rows = [r for r in raw_rows if dataset == 'all' or is_synthetic(r) == (dataset == 'simulated')]
+    df = pd.DataFrame(rows, columns=BASE_COLUMNS)
+    df[ORIGIN] = [origin_label(r) for r in rows]
+    for col in NUMERIC:
         df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    df['debit_tier'] = pd.cut(
-        df['debit_mbps'],
-        bins=[0, 50, 100, 200, 500, 1000, float('inf')],
-        labels=['<= 50', '51-100', '101-200', '201-500', '501-1000', '> 1000'],
-        right=False,
-    )
-    df['prix_par_100_mbps'] = df.apply(
-        lambda row: (row['prix_mensuel_ttc'] / row['debit_mbps']) * 100 if pd.notna(row['debit_mbps']) and row['debit_mbps'] else None,
-        axis=1,
-    )
-    df['est_avec_tv'] = df['nom_offre'].fillna('').str.contains('TV', case=False, na=False)
+    df = df[(df.segment.fillna('').str.strip().str.upper() == 'B2C') &
+            (df.technologie.fillna('').str.strip().str.casefold() == 'fibre')].copy()
+    df['edition_affichee'] = df['edition'].fillna('Édition non précisée')
     return df
 
 
-def get_market_dataframe(operator_name: str | None = None, fibre_only: bool = True):
-    base_columns = [
-        'id_offre', 'operateur', 'nom_offre', 'segment', 'technologie', 'debit_mbps', 'prix_mensuel_ttc',
-        'engagement_mois', 'frais_installation_ttc', 'appels_inclus', 'conditions_offre', 'nom_fichier',
-        'edition', 'url_source', 'page_source', 'extrait_source', 'debit_tier', 'prix_par_100_mbps',
-        'est_avec_tv', 'prix_median_market', 'ecart_a_median_market', 'ecart_pct_market', 'rang_operateur'
-    ]
-
-    offers = read_valid_offers()
-    df = _prepare_offers_frame(offers)
-    if df.empty:
-        return pd.DataFrame(columns=base_columns)
-
-    if operator_name:
-        df = df[df['operateur'] == operator_name].copy()
-
-    df = df[df['est_avec_tv'] == (not fibre_only)].copy() if not df.empty else df
-
-    market_tier_medians = _prepare_offers_frame(read_valid_offers())
-    if market_tier_medians.empty:
-        return df.reindex(columns=base_columns)
-
-    market_tier_medians = market_tier_medians[market_tier_medians['est_avec_tv'] == (not fibre_only)].copy()
-    median_prices = market_tier_medians.groupby('debit_tier', observed=False)['prix_mensuel_ttc'].median().rename('prix_median_market')
-
-    if df.empty:
-        return df.reindex(columns=base_columns)
-
-    df = df.merge(median_prices, on='debit_tier', how='left')
-    df['ecart_a_median_market'] = df['prix_mensuel_ttc'] - df['prix_median_market']
-    df['ecart_pct_market'] = df.apply(
-        lambda row: (row['ecart_a_median_market'] / row['prix_median_market']) * 100 if pd.notna(row['prix_median_market']) and row['prix_median_market'] else None,
-        axis=1,
-    )
-    df['rang_operateur'] = df.groupby('debit_tier')['prix_mensuel_ttc'].rank(method='first', ascending=True)
-    return df.reindex(columns=base_columns).sort_values(['debit_tier', 'prix_mensuel_ttc'])
+def analyse_dataframe(df):
+    df = df.copy()
+    df['prix_par_100_mbps'] = (df.prix_mensuel_ttc * 100 / df.debit_mbps.where(df.debit_mbps > 0)).round(2)
+    df['debit_tier'] = df.debit_mbps
+    for col in ['prix_median_market', 'ecart_a_median_market', 'rang_operateur']:
+        df[col] = float('nan')
+    usable = df[(df.debit_mbps > 0) & df.prix_mensuel_ttc.notna()]
+    # Les simulations peuvent être affichées avec les données réelles, jamais agrégées avec elles.
+    grouping = [ORIGIN, 'debit_mbps'] if ORIGIN in usable.columns else ['debit_mbps']
+    for _, group in usable.groupby(grouping):
+        if group.operateur.nunique() < 2:
+            continue
+        median = group.prix_mensuel_ttc.median()
+        ranks = group.groupby('operateur').prix_mensuel_ttc.min().rank(method='dense')
+        df.loc[group.index, 'prix_median_market'] = median
+        df.loc[group.index, 'ecart_a_median_market'] = (group.prix_mensuel_ttc - median).round(2)
+        df.loc[group.index, 'rang_operateur'] = group.operateur.map(ranks)
+    return df
 
 
-def compute_missed_tiers(operator_name: str | None = None, fibre_only: bool = True):
-    raw = read_valid_offers()
-    df = _prepare_offers_frame(raw)
-    if df.empty:
-        return []
+def get_market_dataframe(operator_name=None, fibre_only=None):
+    if fibre_only is not None:
+        raise ValueError('Le statut TV ne peut pas être déduit du nom des offres.')
+    df = analyse_dataframe(_prepare_offers_frame(read_valid_offers()))
+    return df if operator_name is None else df[df.operateur == operator_name]
 
-    if fibre_only:
-        df = df[~df['est_avec_tv']].copy()
-    else:
-        df = df[df['est_avec_tv']].copy()
 
-    if operator_name:
-        selected = df[df['operateur'] == operator_name].copy()
-    else:
-        selected = df.copy()
+def compute_missed_tiers(operator_name, fibre_only=None, *, frame=None):
+    if fibre_only is not None:
+        raise ValueError('Statut TV non structuré dans le schéma actuel.')
+    df = _prepare_offers_frame(read_valid_offers()) if frame is None else frame
+    tiers = set(df.loc[df.debit_mbps > 0, 'debit_mbps'].dropna())
+    owned = set(df.loc[df.operateur == operator_name, 'debit_mbps'].dropna())
+    return sorted(tiers - owned)
 
-    market_tiers = set(df['debit_tier'].dropna().unique())
-    selected_tiers = set(selected['debit_tier'].dropna().unique())
-    return sorted(market_tiers - selected_tiers, key=lambda item: str(item))
+
+def business_table(df):
+    cols = ['operateur', 'nom_offre', 'debit_mbps', 'prix_mensuel_ttc', 'engagement_mois', 'appels_inclus']
+    out = df[cols].copy()
+    if ORIGIN in df.columns:
+        out.insert(0, 'Origine des données', df[ORIGIN])
+    out['Tarif document (DH)'] = df.extrait_source.map(lambda value:
+        unpack_proof(value).get('terms', {}).get('prix_normal_document') if unpack_proof(value) else None)
+    out['engagement_mois'] = out.engagement_mois.map(lambda v: 'Non précisé' if pd.isna(v) else f'{v:g} mois')
+    out['appels_inclus'] = out.appels_inclus.fillna('Non précisés — consulter les conditions')
+    return out.rename(columns=LABELS)
+
+
+def _style(fig):
+    fig.update_layout(paper_bgcolor='white', plot_bgcolor='white', font_color='#172B4D',
+                      margin=dict(l=12, r=12, t=48, b=12), legend_title_text='Opérateur')
+    return fig
+
+
+def _comparable_rows(df, required):
+    known = df.dropna(subset=required).copy()
+    if ORIGIN in known.columns:
+        counts = known.groupby(ORIGIN).operateur.transform('nunique')
+        known = known[counts >= 2]
+    elif known.operateur.nunique() < 2:
+        return known.iloc[0:0]
+    return known
+
+
+def _chart_options(df, title):
+    if ORIGIN not in df.columns:
+        return dict(title=title)
+    options = dict(title=title)
+    if (df[ORIGIN] == SIMULATED).any():
+        options['title'] += ' — simulations : aucun tarif officiel'
+    if df[ORIGIN].nunique() > 1:
+        options['facet_col'] = ORIGIN
+    return options
 
 
 def create_price_chart(df):
-    if df.empty:
+    known = _comparable_rows(df, ['prix_mensuel_ttc'])
+    if known.empty:
         return None
-    return px.bar(
-        df,
-        x='nom_offre',
-        y='prix_mensuel_ttc',
-        color='operateur',
-        title='Prix mensuel TTC par offre',
-        labels={'prix_mensuel_ttc': 'Prix mensuel TTC (DH)', 'nom_offre': 'Offre'},
-    )
+    return _style(px.bar(known, x='nom_offre', y='prix_mensuel_ttc', color='operateur',
+                         barmode='group', labels=LABELS, **_chart_options(known, 'Prix des offres du périmètre')))
 
 
 def create_speed_chart(df):
-    if df.empty:
+    known = _comparable_rows(df, ['debit_mbps', 'prix_mensuel_ttc'])
+    if known.empty:
         return None
-    return px.scatter(
-        df,
-        x='debit_mbps',
-        y='prix_par_100_mbps',
-        color='operateur',
-        size='prix_mensuel_ttc',
-        hover_name='nom_offre',
-        title='Prix par 100 Mbps',
-        labels={'debit_mbps': 'Débit (Mbps)', 'prix_par_100_mbps': 'Prix / 100 Mbps (DH)'}
-    )
+    return _style(px.scatter(known, x='debit_mbps', y='prix_mensuel_ttc', color='operateur',
+                             hover_name='nom_offre', labels=LABELS, **_chart_options(known, 'Débit et prix mensuel')))
 
 
 def create_gap_chart(df):
-    if df.empty:
+    known = _comparable_rows(df, ['ecart_a_median_market'])
+    if known.empty:
         return None
-    return px.bar(
-        df,
-        x='nom_offre',
-        y='ecart_a_median_market',
-        color='operateur',
-        title='Écart au prix médian du marché',
-        labels={'ecart_a_median_market': 'Écart (DH)', 'nom_offre': 'Offre'}
-    )
+    return _style(px.bar(known, x='nom_offre', y='ecart_a_median_market', color='operateur',
+                         labels=LABELS, **_chart_options(known, 'Écart à la médiane du même débit')))

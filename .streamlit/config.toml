@@ -1,0 +1,23 @@
+[theme]
+base = "light"
+primaryColor = "#087F8C"
+backgroundColor = "#F5F7FB"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#172B4D"
+borderColor = "#DFE5ED"
+showWidgetBorder = true
+showSidebarBorder = true
+headingFontSizes = ["2rem", "1.4rem", "1.1rem", "1rem", "1rem", "1rem"]
+metricValueFontSize = "1.8rem"
+paddingTop = "2rem"
+paddingBottom = "2rem"
+chartCategoricalColors = ["#087F8C", "#5268A8", "#E6A23C", "#617D8A"]
+
+[theme.sidebar]
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F7FB"
+paddingTop = "1.5rem"
+
+[server]
+address = "127.0.0.1"
+port = 8502
