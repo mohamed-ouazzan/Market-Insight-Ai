@@ -17,7 +17,3 @@ chartCategoricalColors = ["#087F8C", "#5268A8", "#E6A23C", "#617D8A"]
 backgroundColor = "#FFFFFF"
 secondaryBackgroundColor = "#F5F7FB"
 paddingTop = "1.5rem"
-
-[server]
-address = "127.0.0.1"
-port = 8502
